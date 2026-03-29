@@ -187,6 +187,9 @@ body{font-family:var(--fn);background:var(--bg);color:var(--text);height:100vh;d
     </div>
     <button class="login-btn" onclick="_loginSubmit()">Sign In</button>
     <div class="login-err" id="li-err"></div>
+    <div style="text-align:center;margin-top:14px;">
+      <a id="forgot-link" href="#" onclick="_forgotPw(event)" style="color:var(--muted);font-size:11px;text-decoration:none;border-bottom:1px dashed var(--border);padding-bottom:1px;cursor:pointer;transition:color .15s;">Forgot password?</a>
+    </div>
   </div>
 </div>
 
@@ -1941,6 +1944,17 @@ function _loginSubmit(){
 }
 document.getElementById('li-u').addEventListener('keydown',function(e){if(e.key==='Enter')document.getElementById('li-p').focus();});
 document.getElementById('li-p').addEventListener('keydown',function(e){if(e.key==='Enter')_loginSubmit();});
+function _forgotPw(e){
+  e.preventDefault();
+  var sub=encodeURIComponent('ShipTrack - Password Reset Request');
+  var body=encodeURIComponent('Hi,\n\nI have forgotten my password for ShipTrack and would like to request a reset.\n\nUsername: '+document.getElementById('li-u').value+'\n\nThank you.');
+  window.location.href='mailto:n.hoaianh93@gmail.com?subject='+sub+'&body='+body;
+  var lk=document.getElementById('forgot-link');
+  lk.textContent='Request sent — check your email app';
+  lk.style.color='var(--green)';
+  lk.style.borderBottom='none';
+  lk.onclick=null;
+}
 if(sessionStorage.getItem('_sa')==='1'){document.getElementById('login-overlay').style.display='none';}
 
 // ── BOOT ──
