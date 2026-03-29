@@ -348,8 +348,29 @@ function ini(id){return String(id).slice(-2);}
 function spin(v){document.getElementById('spin').style.display=v?'flex':'none';}
 function showErr(msg){var e=document.getElementById('eb');e.textContent='Error: '+msg;e.style.display='block';setTimeout(function(){e.style.display='none';},5000);}
 
+var _ALL_ORDERS_CACHE=null;
+async function _getAllOrders(){
+  if(!_ALL_ORDERS_CACHE){var r=await fetch('api/all_orders.json');_ALL_ORDERS_CACHE=await r.json();}
+  return _ALL_ORDERS_CACHE;
+}
 async function apiFetch(url){
-  var r=await fetch(url);
+  // Rewrite API paths to static JSON files
+  var staticUrl=url
+    .replace(/^\/api\/driver\/(\d+)$/,'api/driver/$1.json')
+    .replace(/^\/api\/drivers$/,'api/drivers.json')
+    .replace(/^\/api\/summary$/,'api/summary.json')
+    .replace(/^\/api\/timeslots$/,'api/timeslots.json');
+  // Handle slot_orders client-side
+  if(url.startsWith('/api/slot_orders')){
+    var params=new URLSearchParams(url.split('?')[1]||'');
+    var slots=params.getAll('slots');
+    var all=await _getAllOrders();
+    var orders=all.filter(function(o){return o.incharge_ts&&slots.indexOf(o.incharge_ts.slice(0,5))>-1;});
+    var inSlotIds=new Set(orders.map(function(o){return o.order_id;}));
+    var created_only=all.filter(function(o){return !inSlotIds.has(o.order_id)&&(o.incharge||o.pick||o.drop);}).slice(0,300);
+    return {orders:orders,created_only:created_only};
+  }
+  var r=await fetch(staticUrl);
   if(!r.ok){var b=await r.json().catch(function(){return{};});throw new Error(b.error||'HTTP '+r.status);}
   return r.json();
 }
