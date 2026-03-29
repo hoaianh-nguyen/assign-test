@@ -251,13 +251,11 @@ body{font-family:var(--fn);background:var(--bg);color:var(--text);height:100vh;d
       <div id="ctab-orders" class="ctab active" onclick="switchCardTab('orders')">Orders</div>
       <div id="ctab-eff" class="ctab" onclick="switchCardTab('eff')">Efficiency</div>
       <div id="ctab-issues" class="ctab" onclick="switchCardTab('issues')" style="color:var(--red)">&#9888; Issues</div>
-      <div id="ctab-whatif" class="ctab" onclick="switchCardTab('whatif')" style="color:var(--yellow)">&#128161; What-if</div>
       <div class="ctab" onclick="openOptCard()" style="color:var(--purple)">&#9881;</div>
     </div>
     <div id="card-orders-panel"></div>
     <div id="card-eff-panel"></div>
     <div id="card-issues-panel" style="display:none;flex:1;overflow-y:auto;padding:8px 10px;min-height:0"></div>
-    <div id="card-whatif-panel" style="display:none;flex:1;overflow-y:auto;padding:8px 10px;min-height:0"></div>
   </div>
 
   <!-- OPTIMIZER CARD -->
@@ -350,8 +348,29 @@ function ini(id){return String(id).slice(-2);}
 function spin(v){document.getElementById('spin').style.display=v?'flex':'none';}
 function showErr(msg){var e=document.getElementById('eb');e.textContent='Error: '+msg;e.style.display='block';setTimeout(function(){e.style.display='none';},5000);}
 
+var _ALL_ORDERS_CACHE=null;
+async function _getAllOrders(){
+  if(!_ALL_ORDERS_CACHE){var r=await fetch('api/all_orders.json');_ALL_ORDERS_CACHE=await r.json();}
+  return _ALL_ORDERS_CACHE;
+}
 async function apiFetch(url){
-  var r=await fetch(url);
+  // Rewrite API paths to static JSON files
+  var staticUrl=url
+    .replace(/^\/api\/driver\/(\d+)$/,'api/driver/$1.json')
+    .replace(/^\/api\/drivers$/,'api/drivers.json')
+    .replace(/^\/api\/summary$/,'api/summary.json')
+    .replace(/^\/api\/timeslots$/,'api/timeslots.json');
+  // Handle slot_orders client-side
+  if(url.startsWith('/api/slot_orders')){
+    var params=new URLSearchParams(url.split('?')[1]||'');
+    var slots=params.getAll('slots');
+    var all=await _getAllOrders();
+    var orders=all.filter(function(o){return o.incharge_ts&&slots.indexOf(o.incharge_ts.slice(0,5))>-1;});
+    var inSlotIds=new Set(orders.map(function(o){return o.order_id;}));
+    var created_only=all.filter(function(o){return !inSlotIds.has(o.order_id)&&(o.incharge||o.pick||o.drop);}).slice(0,300);
+    return {orders:orders,created_only:created_only};
+  }
+  var r=await fetch(staticUrl);
   if(!r.ok){var b=await r.json().catch(function(){return{};});throw new Error(b.error||'HTTP '+r.status);}
   return r.json();
 }
@@ -370,7 +389,7 @@ function setMode(m){
 // ── CARD TABS ──
 function switchCardTab(tab){
   document.getElementById('card').style.display='flex';
-  ['orders','eff','issues','whatif'].forEach(function(t){
+  ['orders','eff','issues'].forEach(function(t){
     var active=t===tab;
     var el=document.getElementById('ctab-'+t);
     if(el) el.classList.toggle('active',active);
@@ -382,7 +401,6 @@ function closeCard(){
   document.getElementById('card').style.display='none';
   SEL_DRIVER=null;
   clearIssueMarkers();
-  clearWhatIfLayers();
   document.querySelectorAll('.di').forEach(function(e){e.classList.remove('active');});
 }
 
@@ -579,7 +597,6 @@ async function selDriver(id){
     // Cache for driver list display
     if(effData) EFF_CACHE[id]=effData.score;
     applyDriverFilter(); // refresh list to show score
-    analyzeWhatIf(sorted, id); // async — populates What-if tab in background
   }
   switchCardTab('orders');
 }
@@ -1118,50 +1135,26 @@ function closeOptCard(){
 
 // Route distance: incharge → NN picks → NN drops
 function routeDist(orders){
-  // Estimate distance using same cluster strategy as the optimized route:
-  // incharge → NN pick cluster → drops within cluster → next NN pick cluster → ...
-  var wC=orders.filter(function(o){return o.pick&&o.drop&&o.incharge;});
+  var wC=orders.filter(function(o){return o.pick&&o.incharge;});
   if(!wC.length) return 0;
-  // Start from earliest incharge
-  var sorted=wC.slice().sort(function(a,b){return (a.incharge_ts||'').localeCompare(b.incharge_ts||'');});
-  var cur=sorted[0].incharge,total=0;
-  var rem=sorted.slice();
-  while(rem.length){
-    // NN pick
-    var b=rem[0],bD=Infinity,bI=0;
-    rem.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.pick[1],o.pick[0]);if(d<bD){bD=d;b=o;bI=i;}});
-    // Collect cluster (≤200m same pick)
-    var cluster=[b],still=[];
-    rem.forEach(function(o,i){
-      if(i===bI) return;
-      if(haverDist(b.pick[1],b.pick[0],o.pick[1],o.pick[0])<=200) cluster.push(o);
-      else still.push(o);
-    });
-    total+=bD; cur=b.pick; rem=still;
-    // NN drops within cluster
-    var remD=cluster.slice();
-    while(remD.length){
-      var bd=remD[0],bdD=Infinity,bdI=0;
-      remD.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.drop[1],o.drop[0]);if(d<bdD){bdD=d;bd=o;bdI=i;}});
-      total+=bdD; cur=bd.drop; remD.splice(bdI,1);
-    }
+  var cur=wC[0].incharge,total=0,remP=wC.slice();
+  while(remP.length){
+    var b=remP[0],bD=Infinity,bI=0;
+    remP.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.pick[1],o.pick[0]);if(d<bD){bD=d;b=o;bI=i;}});
+    total+=bD;cur=b.pick;remP.splice(bI,1);
+  }
+  var remD=orders.filter(function(o){return o.drop;}).slice();
+  while(remD.length){
+    var b2=remD[0],bD2=Infinity,bI2=0;
+    remD.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.drop[1],o.drop[0]);if(d<bD2){bD2=d;b2=o;bI2=i;}});
+    total+=bD2;cur=b2.drop;remD.splice(bI2,1);
   }
   return total;
 }
 function estimateMins(orders){return Math.round(routeDist(orders)/300);}
 
 function buildBundles(orders, originPt){
-  // Normalize order_id to string and deduplicate — backend may return multiple
-  // event rows (incharge / pick / delivered) per order_id
-  var seen=new Set();
-  var wC=orders.filter(function(o){
-    if(!o.pick||!o.drop||!o.incharge) return false;
-    var key=String(o.order_id);
-    if(seen.has(key)) return false;
-    seen.add(key);
-    o.order_id=key; // normalize to string throughout
-    return true;
-  });
+  var wC=orders.filter(function(o){return o.pick&&o.drop&&o.incharge;});
   if(!wC.length) return [];
 
   // ── Filter to 2km radius of origin (first incharge point) ──
@@ -1207,9 +1200,7 @@ function buildBundles(orders, originPt){
     return true;
   }
 
-  // ── Seed: group by pickup proximity only (≤200m = same merchant location).
-  //    wave_id encodes the shipper's wave, NOT a merchant batch — grouping all orders
-  //    by wave_id creates giant 18-order bundles that are impossible to optimize.
+  // ── Seed: group shared pickups (≤200m = same merchant) ──
   var seeds=[], usedSeed=new Set();
   wC.forEach(function(o){
     if(usedSeed.has(o.order_id)) return;
@@ -1237,13 +1228,15 @@ function buildBundles(orders, originPt){
       expectedTrend = a>1e-6?1:(a<-1e-6?-1:0);
     }
     var improved=true;
-    while(improved && bundle.length<5){  // cap at 5 — larger bundles always lose to actual
+    while(improved){
       improved=false;
       var bestCand=null, bestDet=ADV_DETOUR;
-      var baseD=routeDist(bundle);  // compute once per extension round, not per candidate
       wC.forEach(function(o){
         if(globalUsed.has(o.order_id)) return;
+        // Direction check from script logic
         if(!isDirectionCompatible(base, o, expectedTrend)) return;
+        // Detour check
+        var baseD=routeDist(bundle);
         var dr=baseD>0?routeDist(bundle.concat([o]))/baseD:1;
         if(dr<bestDet && estimateMins(bundle.concat([o]))<=ADV_TARGET){
           bestDet=dr; bestCand=o;
@@ -1294,14 +1287,7 @@ function buildBundles(orders, originPt){
 }
 
 function runAdvEval(){
-  // Deduplicate by order_id (backend may return one row per event)
-  var _seen=new Set();
-  var orders=OPT_SCOPE_ORDERS.filter(function(o){
-    if(!o.pick||!o.drop||!o.incharge) return false;
-    var k=String(o.order_id);
-    if(_seen.has(k)) return false;
-    _seen.add(k); o.order_id=k; return true;
-  });
+  var orders=OPT_SCOPE_ORDERS.filter(function(o){return o.pick&&o.drop&&o.incharge;});
   var sum=document.getElementById('adv-summary');
   if(orders.length<1){
     sum.textContent='No orders with full coordinates. Load a driver route or select time slots first.';
@@ -1358,7 +1344,6 @@ function renderAdvResults(bundles){
     var sc=b.score>=70?'var(--green)':b.score>=45?'var(--yellow)':'var(--red)';
     var dc=b.driverColor||'var(--accent)';
     var bdg='';
-    if(b.wave_id) bdg+='<span style="font-size:11px;background:rgba(251,191,36,.12);color:var(--yellow);padding:2px 6px;border-radius:4px;border:1px solid rgba(251,191,36,.3)" title="Same wave ID">&#9741; Wave '+b.wave_id+'</span> ';
     if(b.spP) bdg+='<span style="font-size:11px;background:rgba(74,222,128,.15);color:var(--green);padding:2px 6px;border-radius:4px;border:1px solid rgba(74,222,128,.3)">&#128246; Shared Pickup</span> ';
     if(b.sdP) bdg+='<span style="font-size:11px;background:rgba(56,189,248,.12);color:var(--accent);padding:2px 6px;border-radius:4px;border:1px solid rgba(56,189,248,.3)">&#127963; Same Zone</span> ';
     if(b.orders.length>2) bdg+='<span style="font-size:11px;background:rgba(167,139,250,.12);color:var(--purple);padding:2px 6px;border-radius:4px;border:1px solid rgba(167,139,250,.3)">'+b.orders.length+' orders</span>';
@@ -1387,7 +1372,6 @@ function renderAdvResults(bundles){
           +'<div style="width:8px;height:8px;border-radius:50%;background:'+c+';flex-shrink:0"></div>'
           +'<span style="font-family:var(--mo);font-weight:700;color:var(--text)">#'+String(o.order_id).slice(-5)+'</span>'
           +'<span style="color:var(--muted);font-size:11px">'+o.assign_type+'</span>'
-          +(o.wave_id&&o.wave_id!=='nan'&&o.wave_id!=='None'?'<span style="color:var(--yellow);font-size:10px;font-family:var(--mo)">w:'+o.wave_id+'</span>':'')
           +'<span style="color:var(--muted);margin-left:auto;font-size:11px;font-family:var(--mo)">'
           +(o.created_ts?'<span style="color:var(--muted);font-size:10px">cr '+o.created_ts+'</span> · ':'')
           +(o.pick_ts||'--')+' → '+(o.drop_ts||'--')+'</span></div>';
@@ -1421,109 +1405,37 @@ function selectBundle(idx){
   // Hide ALL other map layers — only show this bundle
   hideMapForOpt();
 
-  // ── BEFORE: actual (red) ──
-  // Real wave execution order (from Step+rank_step column):
-  //   incharge all orders → pick all (NN from incharge) → drop all (NN from last pick)
-  // This matches the raw data: incharge1, incharge2, pick3, pick4, drop5, drop6
-  var actual=orders.filter(function(o){return o.pick&&o.drop;})
-    .slice().sort(function(a,b){return (a.incharge_ts||'').localeCompare(b.incharge_ts||'');});
+  // ── BEFORE: actual (red, per-order incharge→pick→drop) ──
+  var actual=orders.slice().sort(function(a,b){return (a.incharge_ts||'').localeCompare(b.incharge_ts||'');});
   var aPts=[];
-
-  // Step 1: start at first incharge
-  var aStart=actual.length&&actual[0].incharge?actual[0].incharge:null;
-  if(aStart) aPts.push([aStart[1],aStart[0]]);
-  var aCur=aStart||[0,0];
-
-  // Step 2: visit all picks in NN order (from incharge point)
-  var aPickRem=actual.slice(),aPickOrder=[];
-  while(aPickRem.length){
-    var aBestP=aPickRem[0],aBestPD=Infinity,aBestPI=0;
-    aPickRem.forEach(function(o,i){var d=haverDist(aCur[1],aCur[0],o.pick[1],o.pick[0]);if(d<aBestPD){aBestPD=d;aBestP=o;aBestPI=i;}});
-    aPts.push([aBestP.pick[1],aBestP.pick[0]]);
-    aPickOrder.push(aBestP);
-    aCur=aBestP.pick;
-    aPickRem.splice(aBestPI,1);
-  }
-
-  // Step 3: visit all drops in NN order (from last pick point)
-  var aDropRem=actual.slice(),aDropOrder=[];
-  while(aDropRem.length){
-    var aBestD=aDropRem[0],aBestDD=Infinity,aBestDI=0;
-    aDropRem.forEach(function(o,i){var d=haverDist(aCur[1],aCur[0],o.drop[1],o.drop[0]);if(d<aBestDD){aBestDD=d;aBestD=o;aBestDI=i;}});
-    aPts.push([aBestD.drop[1],aBestD.drop[0]]);
-    aDropOrder.push(aBestD);
-    aCur=aBestD.drop;
-    aDropRem.splice(aBestDI,1);
-  }
-
-  if(aPts.length>=2) ADV_LAYERS.push(L.polyline(aPts,{color:'#f87171',weight:2.5,opacity:.85}).addTo(map));
-
-  // Label: A1 at incharge, then each pick stop, then each drop stop
-  var aLabelSeq=[];
-  if(aStart) aLabelSeq.push({pt:aStart,label:'A0'});
-  aPickOrder.forEach(function(o,i){aLabelSeq.push({pt:o.pick,label:'A'+(i+1)});});
-  aDropOrder.forEach(function(o,i){aLabelSeq.push({pt:o.drop,label:'AD'+(i+1)});});
-  aLabelSeq.forEach(function(item){
-    var ic=L.divIcon({className:'',html:'<div style="background:#f87171;color:#0d1117;font-family:monospace;font-size:10px;font-weight:800;padding:1px 4px;border-radius:3px">'+item.label+'</div>',iconAnchor:[-5,6]});
-    ADV_LAYERS.push(L.marker([item.pt[1],item.pt[0]],{icon:ic,interactive:false,zIndexOffset:500}).addTo(map));
+  actual.forEach(function(o,i){
+    var seg=[];
+    if(o.incharge) seg.push([o.incharge[1],o.incharge[0]]);
+    if(o.pick)     seg.push([o.pick[1],    o.pick[0]]);
+    if(o.drop)     seg.push([o.drop[1],    o.drop[0]]);
+    if(seg.length>=2){ADV_LAYERS.push(L.polyline(seg,{color:'#f87171',weight:2.5,opacity:.85}).addTo(map));seg.forEach(function(p){aPts.push(p);});}
+    if(o.incharge){var ic=L.divIcon({className:'',html:'<div style="background:#f87171;color:#0d1117;font-family:monospace;font-size:10px;font-weight:800;padding:1px 4px;border-radius:3px">A'+(i+1)+'</div>',iconAnchor:[-5,6]});ADV_LAYERS.push(L.marker([o.incharge[1],o.incharge[0]],{icon:ic,interactive:false,zIndexOffset:500}).addTo(map));}
   });
 
-  // ── AFTER: optimized (purple dashed) ──
-  // Strategy: group by shared pickup (≤200m = same merchant/wave),
-  // then for each pickup cluster: go to shared pick point once → NN drops for that cluster.
-  // This interleaves pick→drops per cluster rather than all-picks-then-all-drops globally,
-  // which avoids the massive double-traversal loop on large bundles.
+  // ── AFTER: optimized (purple dashed — shared pick once → NN drops) ──
   var orders2=orders.filter(function(o){return o.pick&&o.drop;});
   var cur2=orders2.length&&orders2[0].incharge?orders2[0].incharge:[0,0];
-
-  // Build pick clusters (≤200m = shared pickup)
-  var remO=orders2.slice(),clusters=[];
+  var remO=orders2.slice(),visitPlan=[];
   while(remO.length){
-    // NN: find cluster whose pick is closest to current position
     var bestO=remO[0],bestDist=Infinity,bestI=0;
-    remO.forEach(function(o,i){
-      var d=haverDist(cur2[1],cur2[0],o.pick[1],o.pick[0]);
-      if(d<bestDist){bestDist=d;bestO=o;bestI=i;}
-    });
-    // Collect all orders sharing this pick point (≤200m)
-    var clusterOrders=[bestO],stillRem=[];
-    remO.forEach(function(o,i){
-      if(i===bestI) return;
-      if(haverDist(bestO.pick[1],bestO.pick[0],o.pick[1],o.pick[0])<=200) clusterOrders.push(o);
-      else stillRem.push(o);
-    });
-    remO=stillRem;
-    clusters.push({pickPt:bestO.pick,orders:clusterOrders});
-    cur2=bestO.pick;
+    remO.forEach(function(o,i){var d=haverDist(cur2[1],cur2[0],o.pick[1],o.pick[0]);if(d<bestDist){bestDist=d;bestO=o;bestI=i;}});
+    var samePick=[bestO],stillRem=[];
+    remO.forEach(function(o,i){if(i===bestI) return;if(haverDist(bestO.pick[1],bestO.pick[0],o.pick[1],o.pick[0])<=200) samePick.push(o);else stillRem.push(o);});
+    remO=stillRem;visitPlan.push({pickPt:bestO.pick,orders:samePick});cur2=bestO.pick;
   }
-
-  // Build optimized path: start → for each cluster: pickPt → NN drops within cluster
-  var oPts=[],pickSeq=[],dropOrd=[];
+  var oPts=[];
   var oStart=orders2[0].incharge||orders2[0].pick;
   if(oStart) oPts.push([oStart[1],oStart[0]]);
-  cur2=oStart||[0,0];
-
-  clusters.forEach(function(cluster,ci){
-    // Move to shared pickup point
-    oPts.push([cluster.pickPt[1],cluster.pickPt[0]]);
-    pickSeq.push({pt:[cluster.pickPt[1],cluster.pickPt[0]],count:cluster.orders.length});
-    cur2=cluster.pickPt;
-
-    // NN drops within this cluster only
-    var remDrops=cluster.orders.filter(function(o){return o.drop;}).slice();
-    while(remDrops.length){
-      var bDrp=remDrops[0],bDD=Infinity,bDI=0;
-      remDrops.forEach(function(o,i){
-        var d=haverDist(cur2[1],cur2[0],o.drop[1],o.drop[0]);
-        if(d<bDD){bDD=d;bDrp=o;bDI=i;}
-      });
-      oPts.push([bDrp.drop[1],bDrp.drop[0]]);
-      dropOrd.push(bDrp);
-      cur2=bDrp.drop;
-      remDrops.splice(bDI,1);
-    }
-  });
-
+  var dropSeq=[],pickSeq=[];
+  visitPlan.forEach(function(step){oPts.push([step.pickPt[1],step.pickPt[0]]);pickSeq.push({pt:[step.pickPt[1],step.pickPt[0]],count:step.orders.length});step.orders.forEach(function(o){if(o.drop) dropSeq.push(o);});});
+  cur2=oPts.length?oPts[oPts.length-1]:[0,0];
+  var remD=dropSeq.slice(),dropOrd=[];
+  while(remD.length){var bD=remD[0],bDD=Infinity,bDI=0;remD.forEach(function(o,i){var d=haverDist(cur2[1],cur2[0],o.drop[1],o.drop[0]);if(d<bDD){bDD=d;bD=o;bDI=i;}});oPts.push([bD.drop[1],bD.drop[0]]);cur2=[bD.drop[1],bD.drop[0]];dropOrd.push(bD);remD.splice(bDI,1);}
   if(oPts.length>=2) ADV_LAYERS.push(L.polyline(oPts,{color:'#a78bfa',weight:3,opacity:.9,dashArray:'8 4'}).addTo(map));
   pickSeq.forEach(function(ps,i){var shared=ps.count>1;var lbl=shared?'P'+(i+1)+'\u00d7'+ps.count:'P'+(i+1);var bg=shared?'#4ade80':'#a78bfa';var ic=L.divIcon({className:'',html:'<div style="background:'+bg+';color:#0d1117;font-family:monospace;font-size:10px;font-weight:800;padding:1px 5px;border-radius:3px;white-space:nowrap">'+lbl+'</div>',iconAnchor:[-5,6]});ADV_LAYERS.push(L.marker(ps.pt,{icon:ic,interactive:false,zIndexOffset:700}).addTo(map));});
   dropOrd.forEach(function(o,i){var ic2=L.divIcon({className:'',html:'<div style="background:#fbbf24;color:#0d1117;font-family:monospace;font-size:10px;font-weight:800;padding:1px 5px;border-radius:3px">D'+(i+1)+'</div>',iconAnchor:[-5,6]});ADV_LAYERS.push(L.marker([o.drop[1],o.drop[0]],{icon:ic2,interactive:false,zIndexOffset:700}).addTo(map));});
@@ -1980,386 +1892,7 @@ function analyzeDriverIssues(orders, driverId){
 }
 
 
-// ── WHAT-IF ANALYSIS ─────────────────────────────────────────
-var WHATIF_LAYERS=[];
-
-function clearWhatIfLayers(){
-  WHATIF_LAYERS.forEach(function(l){map.removeLayer(l);});
-  WHATIF_LAYERS=[];
-}
-
-async function analyzeWhatIf(driverOrders, driverId){
-  var panel=document.getElementById('card-whatif-panel');
-  panel.innerHTML='<div style="color:var(--muted);font-size:12px;padding:10px">⏳ Loading orders in same time window...</div>';
-
-  // ── Step 1: Compute driver's active time window from incharge times ──
-  function toMin(ts){if(!ts) return null;var p=ts.split(':');return +p[0]*60+ +p[1];}
-  var inchargeMins=driverOrders.filter(function(o){return o.incharge_ts;}).map(function(o){return toMin(o.incharge_ts);});
-  var createdMins=driverOrders.filter(function(o){return o.created_ts;}).map(function(o){return toMin(o.created_ts);});
-  if(!inchargeMins.length){panel.innerHTML='<div style="color:var(--muted);font-size:12px;padding:10px">No incharge timestamps.</div>';return;}
-
-  // Use CREATED time window to find what was available when orders were dispatched
-  var allMins=(createdMins.length?createdMins:inchargeMins);
-  var winMin=Math.min.apply(null,allMins)-20; // 20min before earliest created
-  var winMax=Math.max.apply(null,allMins)+20; // 20min after latest created
-
-  // Convert to HH:MM slot keys (5-min buckets)
-  function minToSlot(m){
-    m=Math.max(0,Math.min(23*60+59,m));
-    var h=Math.floor(m/60), mm=Math.floor(m/5)*5%60;
-    return String(h).padStart(2,'0')+':'+String(mm).padStart(2,'0');
-  }
-  var slots=[];
-  for(var m=Math.floor(winMin/5)*5;m<=winMax;m+=5) slots.push(minToSlot(m));
-  slots=[...new Set(slots)];
-
-  // ── Step 2: Fetch all orders in the time window via slot API ──
-  var windowOrders=[], windowCreated=[];
-  try{
-    var params=slots.map(function(s){return 'slots='+encodeURIComponent(s);}).join('&');
-    var data=await apiFetch('/api/slot_orders?'+params);
-    windowOrders=data.orders||[];
-    windowCreated=data.created_only||[];
-  }catch(e){panel.innerHTML='<div style="color:var(--red);font-size:12px;padding:10px">Failed to load window orders: '+e.message+'</div>';return;}
-
-  var allWindow=windowOrders.concat(windowCreated);
-  // Exclude this driver's own orders
-  var myIds=new Set(driverOrders.map(function(o){return String(o.order_id);}));
-  var candidates=allWindow.filter(function(o){return !myIds.has(String(o.order_id))&&o.pick&&o.drop;});
-
-  if(!candidates.length){
-    panel.innerHTML='<div style="color:var(--muted);font-size:12px;padding:16px;text-align:center">No other orders found in window<br><span style="font-size:11px">'+minToSlot(winMin)+' – '+minToSlot(winMax)+'</span></div>';
-    return;
-  }
-
-  // ── Step 3: Score each candidate against driver's assignments ──
-  // Per script logic: direction compat + 2km pickup radius + timing overlap
-  function vec(p1,p2){var avg=(p1[1]+p2[1])/2*Math.PI/180;return [(p2[0]-p1[0])*Math.cos(avg),p2[1]-p1[1]];}
-  function dot(v1,v2){return v1[0]*v2[0]+v1[1]*v2[1];}
-  function angBetween(v1,v2){return Math.atan2(v1[0]*v2[1]-v1[1]*v2[0],dot(v1,v2))*180/Math.PI;}
-
-  // Driver's pickup centroid (approximate position when orders arrived)
-  var myWithCoords=driverOrders.filter(function(o){return o.pick&&o.incharge;});
-  if(!myWithCoords.length){panel.innerHTML='<div style="color:var(--muted);font-size:12px;padding:10px">Driver has no coordinate data.</div>';return;}
-
-  // Sort driver orders by incharge time — base order is first
-  var myOrdered=myWithCoords.slice().sort(function(a,b){return (a.incharge_ts||'').localeCompare(b.incharge_ts||'');});
-  var baseOrder=myOrdered[0];
-  var pickCentLat=myOrdered.reduce(function(s,o){return s+o.pick[1];},0)/myOrdered.length;
-  var pickCentLng=myOrdered.reduce(function(s,o){return s+o.pick[0];},0)/myOrdered.length;
-
-  var scored=[];
-  candidates.forEach(function(c){
-    if(!c.pick||!c.drop) return;
-    var distToBase=haverDist(baseOrder.pick[1],baseOrder.pick[0],c.pick[1],c.pick[0]);
-    var distToCent=haverDist(pickCentLat,pickCentLng,c.pick[1],c.pick[0]);
-
-    // ── Criterion 1: Distance — must be within 2km of driver's first pickup (script rule) ──
-    if(distToBase>3000) return; // skip far orders
-
-    var score=0, reasons=[], flags=[];
-
-    // Proximity score (0-30)
-    var proxScore=Math.round(Math.max(0,30*(1-distToBase/3000)));
-    score+=proxScore;
-    if(distToBase<500) reasons.push('Very close pickup ('+Math.round(distToBase)+'m)');
-    else reasons.push('Pickup '+Math.round(distToBase)+'m from base');
-
-    // ── Criterion 2: Direction compatibility (script: angle <89°, forward direction) ──
-    var vBase=vec(baseOrder.pick,baseOrder.drop);
-    var vCand=vec(c.pick,c.drop);
-    var dirAngle=Math.abs(angBetween(vBase,vCand));
-    var isForward=dot(vBase,vec(baseOrder.pick,c.pick))>=0;
-    if(dirAngle<89&&isForward){
-      score+=30;
-      reasons.push('Direction compatible ('+Math.round(dirAngle)+'°)');
-    } else if(dirAngle<89){
-      score+=15;
-      flags.push('Backward pickup direction');
-    } else {
-      flags.push('Incompatible direction ('+Math.round(dirAngle)+'°)');
-      score-=10;
-    }
-
-    // ── Criterion 3: Timing — created time overlap with driver's batch ──
-    var cCreatedMin=toMin(c.created_ts||c.incharge_ts);
-    var myCreatedMin=toMin(baseOrder.created_ts||baseOrder.incharge_ts)||0;
-    var timeDiff=cCreatedMin!=null?Math.abs(cCreatedMin-myCreatedMin):99;
-    if(timeDiff<=10){score+=25;reasons.push('Created same time ('+timeDiff+'min apart)');}
-    else if(timeDiff<=20){score+=15;reasons.push('Created '+timeDiff+'min apart');}
-    else if(timeDiff<=30){score+=8;reasons.push('Created '+timeDiff+'min apart');}
-    else{flags.push('Created '+timeDiff+'min apart — different wave');}
-
-    // ── Criterion 4: Same merchant (≤200m pickup = shared pick) ──
-    var sharedPick=haverDist(baseOrder.pick[1],baseOrder.pick[0],c.pick[1],c.pick[0])<200;
-    if(sharedPick){score+=20;reasons.push('Same merchant pickup');}
-
-    // ── Criterion 5: Drop zone overlap with driver's drops ──
-    var dropNear=myOrdered.some(function(m){return m.drop&&haverDist(m.drop[1],m.drop[0],c.drop[1],c.drop[0])<500;});
-    if(dropNear){score+=15;reasons.push('Drop near existing drops');}
-
-    // Who got this order?
-    var assignedTo=c.shipper_id?String(c.shipper_id):'unassigned';
-    var isAssigned=c.incharge_ts!=null;
-
-    scored.push({order:c,score:Math.max(0,Math.min(100,score)),reasons:reasons,flags:flags,
-      distToBase:Math.round(distToBase),timeDiff:timeDiff,dirAngle:Math.round(dirAngle),
-      isForward:isForward,sharedPick:sharedPick,assignedTo:assignedTo,isAssigned:isAssigned});
-  });
-
-  // Sort by score descending
-  scored.sort(function(a,b){return b.score-a.score;});
-  var top=scored.slice(0,15);
-
-  // ── Step 4: Render with multi-select + wave compare ──
-  var goodFit=top.filter(function(x){return x.score>=50;});
-  var windowStr=minToSlot(winMin)+' – '+minToSlot(winMax);
-  window._whatIfScored=top;
-  window._whatIfDriverOrders=myOrdered;
-  window._whatIfSelected=new Set(); // indices of selected candidates
-
-  function renderWhatIfPanel(){
-    var sel=window._whatIfSelected;
-    var html='';
-
-    // Header bar
-    html+='<div style="position:sticky;top:0;background:rgba(17,24,39,.97);z-index:2;padding-bottom:6px;margin-bottom:4px">'
-      +'<div style="font-size:12px;color:var(--muted);margin-bottom:6px">'
-      +'Window <span style="color:var(--accent);font-family:var(--mo)">'+windowStr+'</span>'
-      +' · '+candidates.length+' other orders'
-      +' · <span style="color:var(--yellow);font-weight:600">'+goodFit.length+' good fits</span></div>'
-      // Compare button
-      +'<div style="display:flex;gap:5px;flex-wrap:wrap">'
-      +'<button onclick="compareWhatIfWave()" style="flex:1;padding:5px 8px;background:rgba(167,139,250,.18);border:1px solid rgba(167,139,250,.5);border-radius:6px;color:var(--purple);font-size:12px;font-weight:700;cursor:pointer;font-family:var(--fn)">'
-      +'&#9654; Compare wave ('+(sel.size)+' selected)</button>'
-      +(sel.size>0?'<button onclick="clearWhatIfSel()" style="padding:5px 8px;background:var(--panel);border:1px solid var(--border);border-radius:6px;color:var(--muted);font-size:12px;cursor:pointer;font-family:var(--fn)">Clear</button>':'')
-      +'</div>'
-      // Wave summary when items selected
-      +(sel.size>0?renderWhatIfWaveSummary():'')
-      +'</div>';
-
-    if(!top.length){
-      html+='<div style="color:var(--muted);font-size:12px;padding:8px">No compatible orders found nearby.</div>';
-    } else {
-      html+=top.map(function(x,i){
-        var isSel=sel.has(i);
-        var sc=x.score>=70?'#4ade80':x.score>=50?'#fbbf24':'#f87171';
-        var scVar=x.score>=70?'var(--green)':x.score>=50?'var(--yellow)':'var(--red)';
-        var ac=x.isAssigned?col(parseInt(x.assignedTo)||0):'#94a3b8';
-        var assignBadge=x.isAssigned
-          ?'<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:'+ac+'22;border:1px solid '+ac+'55;color:'+ac+';font-family:var(--mo)">→'+x.assignedTo+'</span>'
-          :'<span style="font-size:10px;padding:1px 5px;border-radius:3px;background:rgba(148,163,184,.12);color:#94a3b8">pending</span>';
-        return '<div id="wi-'+i+'" onclick="toggleWhatIfSel('+i+')" style="margin-bottom:5px;padding:8px 10px;background:var(--panel);border:2px solid '+(isSel?scVar:'var(--border)')+';border-radius:8px;cursor:pointer;transition:border-color .15s;'+(isSel?'background:rgba(167,139,250,.05)':'')+'">'
-          +'<div style="display:flex;align-items:center;gap:5px;margin-bottom:3px">'
-          +'<div style="width:14px;height:14px;border-radius:3px;border:2px solid '+(isSel?sc:'var(--muted)')+';background:'+(isSel?sc:'transparent')+';flex-shrink:0;transition:all .12s"></div>'
-          +'<span style="font-family:var(--mo);font-size:12px;font-weight:800;color:var(--text)">#'+String(x.order.order_id).slice(-5)+'</span>'
-          +assignBadge
-          +(x.sharedPick?'<span style="font-size:10px;padding:1px 4px;border-radius:3px;background:rgba(74,222,128,.12);color:var(--green)">same pick</span>':'')
-          +'<span style="margin-left:auto;font-family:var(--mo);font-size:13px;font-weight:800;color:'+scVar+'">'+x.score+'</span>'
-          +'</div>'
-          +'<div style="display:flex;gap:8px;font-size:11px;color:var(--muted);flex-wrap:wrap">'
-          +'<span>'+x.distToBase+'m away</span>'
-          +'<span>'+x.timeDiff+'min Δt</span>'
-          +'<span>'+x.dirAngle+'°'+(x.isForward?' ✓':' ✗')+'</span>'
-          +(x.order.created_ts?'<span style="font-family:var(--mo)">cr '+x.order.created_ts+'</span>':'')
-          +'</div>'
-          +(x.reasons.length?'<div style="font-size:10px;color:var(--green);margin-top:2px">✓ '+x.reasons.join(' · ')+'</div>':'')
-          +(x.flags.length?'<div style="font-size:10px;color:var(--red);margin-top:1px">✗ '+x.flags.join(' · ')+'</div>':'')
-          +'</div>';
-      }).join('');
-    }
-
-    html+='<div style="font-size:10px;color:var(--muted);margin-top:8px;padding:5px 7px;background:rgba(56,189,248,.04);border:1px solid rgba(56,189,248,.12);border-radius:5px;line-height:1.5">'
-      +'Scoring: Direction (30) + Proximity (30) + Timing (25) + Same merchant (20) + Drop zone (15). Check orders to build a hypothetical wave, then click Compare.</div>';
-
-    panel.innerHTML=html;
-  }
-
-  function renderWhatIfWaveSummary(){
-    var sel=window._whatIfSelected;
-    if(!sel.size) return '';
-    var selOrders=Array.from(sel).map(function(i){return top[i].order;});
-    var allOrders=myOrdered.concat(selOrders.filter(function(o){return o.pick&&o.drop;}));
-    var dist=computeWaveDist(allOrders);
-    var actualDist=computeWaveDist(myOrdered.filter(function(o){return o.pick&&o.drop;}));
-    var saving=Math.round((actualDist-dist)/100)/10;
-    return '<div style="margin-top:5px;padding:5px 8px;background:rgba(167,139,250,.08);border:1px solid rgba(167,139,250,.25);border-radius:5px;font-size:11px">'
-      +'<span style="color:var(--purple);font-weight:700">Wave preview: </span>'
-      +'<span style="color:var(--text)">'+myOrdered.length+' actual + '+sel.size+' what-if = '+(myOrdered.length+sel.size)+' orders</span>'
-      +(saving>0
-        ?'  <span style="color:var(--green);font-weight:700">↑ saves ~'+saving+'km vs current</span>'
-        :'  <span style="color:var(--muted)">~'+Math.round(dist/100)/10+'km wave</span>')
-      +'</div>';
-  }
-
-  function computeWaveDist(orders){
-    var wc=orders.filter(function(o){return o.pick&&o.drop;});
-    if(!wc.length) return 0;
-    // shared-pick → NN drops strategy
-    var sorted2=wc.slice().sort(function(a,b){return (a.incharge_ts||a.created_ts||'').localeCompare(b.incharge_ts||b.created_ts||'');});
-    var cur=sorted2[0].incharge||sorted2[0].pick, total=0, rem=sorted2.slice();
-    while(rem.length){
-      var b2=rem[0],bd=Infinity,bi=0;
-      rem.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.pick[1],o.pick[0]);if(d<bd){bd=d;b2=o;bi=i;}});
-      var cluster2=[b2],still2=[];
-      rem.forEach(function(o,i){if(i===bi) return;if(haverDist(b2.pick[1],b2.pick[0],o.pick[1],o.pick[0])<=200) cluster2.push(o);else still2.push(o);});
-      total+=bd; cur=b2.pick; rem=still2;
-      var rd=cluster2.slice();
-      while(rd.length){var bd2=rd[0],bdd=Infinity,bdi=0;rd.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.drop[1],o.drop[0]);if(d<bdd){bdd=d;bd2=o;bdi=i;}});total+=bdd;cur=bd2.drop;rd.splice(bdi,1);}
-    }
-    return total;
-  }
-
-  window.toggleWhatIfSel=function(i){
-    var sel=window._whatIfSelected;
-    if(sel.has(i)) sel.delete(i); else sel.add(i);
-    renderWhatIfPanel();
-  };
-  window.clearWhatIfSel=function(){window._whatIfSelected=new Set();clearWhatIfLayers();renderWhatIfPanel();};
-
-  renderWhatIfPanel();
-}
-
-function compareWhatIfWave(){
-  clearWhatIfLayers();
-  var sel=window._whatIfSelected||new Set();
-  var top=window._whatIfScored||[];
-  var myOrdered=window._whatIfDriverOrders||[];
-  if(!myOrdered.length) return;
-
-  // Restore driver route as dim background
-  if(SEL_DRIVER&&ROUTES[SEL_DRIVER]&&ROUTES[SEL_DRIVER].layers){
-    ROUTES[SEL_DRIVER].layers.forEach(function(l){if(!l._map) l.addTo(map);});
-  }
-
-  var selCandidates=Array.from(sel).map(function(i){return top[i].order;}).filter(function(o){return o.pick&&o.drop;});
-
-  // ── ACTUAL route: red — driver's current orders only ──
-  drawWaveRoute(myOrdered.filter(function(o){return o.pick&&o.drop;}), '#f87171', false, 'Actual');
-
-  if(!selCandidates.length){showErr('Select at least one candidate order first');return;}
-
-  // ── WHAT-IF route: purple dashed — all driver orders + selected candidates ──
-  var whatIfOrders=myOrdered.filter(function(o){return o.pick&&o.drop;}).concat(selCandidates);
-  drawWaveRoute(whatIfOrders, '#a78bfa', true, 'What-if');
-
-  // Draw candidate orders individually to show where they come from
-  selCandidates.forEach(function(o,ci){
-    var cColor=['#4ade80','#fbbf24','#38bdf8','#fb923c','#e879f9'][ci%5];
-    if(o.pick&&o.drop){
-      WHATIF_LAYERS.push(L.circleMarker([o.pick[1],o.pick[0]],{radius:8,color:cColor,fillColor:cColor,fillOpacity:.8,weight:2}).addTo(map));
-      WHATIF_LAYERS.push(L.circleMarker([o.drop[1],o.drop[0]],{radius:8,color:cColor,fillColor:cColor,fillOpacity:.8,weight:2}).addTo(map));
-      var ic=L.divIcon({className:'',html:'<div style="background:'+cColor+';color:#0d1117;font-family:monospace;font-size:10px;font-weight:800;padding:1px 5px;border-radius:4px;white-space:nowrap">+#'+String(o.order_id).slice(-5)+'</div>',iconAnchor:[0,8]});
-      WHATIF_LAYERS.push(L.marker([o.pick[1],o.pick[0]],{icon:ic,zIndexOffset:900}).addTo(map));
-    }
-  });
-
-  // Distance comparison panel at top of what-if panel
-  var actualDist=computeWaveDistGlobal(myOrdered.filter(function(o){return o.pick&&o.drop;}));
-  var whatifDist=computeWaveDistGlobal(whatIfOrders);
-  var saving=Math.round((actualDist-whatifDist)/100)/10;
-  var savPct=actualDist>0?Math.round((actualDist-whatifDist)/actualDist*100):0;
-
-  // Insert comparison panel at top of what-if panel
-  var existing=document.getElementById('wi-compare-bar');
-  if(existing) existing.remove();
-  var bar=document.createElement('div');
-  bar.id='wi-compare-bar';
-  bar.style.cssText='position:sticky;top:0;z-index:10;background:rgba(13,17,23,.98);padding:8px;margin-bottom:6px;border-radius:7px;border:1px solid rgba(167,139,250,.4)';
-  bar.innerHTML='<div style="font-size:12px;font-weight:700;color:var(--purple);margin-bottom:5px">Route Comparison</div>'
-    +'<div style="display:grid;grid-template-columns:1fr 1fr;gap:5px;margin-bottom:5px">'
-    +'<div style="padding:5px 7px;background:rgba(248,113,113,.08);border:1px solid rgba(248,113,113,.3);border-radius:5px">'
-    +'<div style="font-size:10px;font-weight:700;color:#f87171">— Actual ('+myOrdered.length+' orders)</div>'
-    +'<div style="font-size:14px;font-weight:800;color:var(--text)">'+Math.round(actualDist/100)/10+' km</div></div>'
-    +'<div style="padding:5px 7px;background:rgba(167,139,250,.08);border:1px solid rgba(167,139,250,.3);border-radius:5px">'
-    +'<div style="font-size:10px;font-weight:700;color:var(--purple)">--- What-if ('+whatIfOrders.length+' orders)</div>'
-    +'<div style="font-size:14px;font-weight:800;color:var(--text)">'+Math.round(whatifDist/100)/10+' km</div></div>'
-    +'</div>'
-    +(saving>0
-      ?'<div style="font-size:12px;font-weight:700;color:var(--green)">↑ What-if saves '+saving+'km ('+savPct+'%) with '+selCandidates.length+' extra order(s)</div>'
-      :'<div style="font-size:12px;color:var(--muted)">What-if adds '+(-saving)+'km for '+selCandidates.length+' extra order(s)</div>');
-  var panel=document.getElementById('card-whatif-panel');
-  if(panel) panel.insertBefore(bar,panel.firstChild);
-
-  // Fit map
-  var allPts=[];
-  whatIfOrders.forEach(function(o){
-    if(o.pick) allPts.push([o.pick[1],o.pick[0]]);
-    if(o.drop) allPts.push([o.drop[1],o.drop[0]]);
-  });
-  if(allPts.length) map.fitBounds(L.latLngBounds(allPts).pad(0.2),{animate:true});
-}
-
-function drawWaveRoute(orders, color, dashed, label){
-  // Build optimised route: shared picks → NN drops (same as bundle optimizer)
-  var rem=orders.slice(), pts=[], pickSeq=[], dropSeq=[];
-  var cur=orders[0].incharge||orders[0].pick;
-  if(cur) pts.push([cur[1],cur[0]]);
-  while(rem.length){
-    var best=rem[0],bestD=Infinity,bestI=0;
-    rem.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.pick[1],o.pick[0]);if(d<bestD){bestD=d;best=o;bestI=i;}});
-    var cluster=[best],still=[];
-    rem.forEach(function(o,i){if(i===bestI) return;if(haverDist(best.pick[1],best.pick[0],o.pick[1],o.pick[0])<=200) cluster.push(o);else still.push(o);});
-    rem=still;
-    pts.push([best.pick[1],best.pick[0]]);
-    pickSeq.push({pt:[best.pick[1],best.pick[0]],count:cluster.length});
-    cur=best.pick;
-    var remD=cluster.slice();
-    while(remD.length){
-      var bd=remD[0],bdd=Infinity,bdi=0;
-      remD.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.drop[1],o.drop[0]);if(d<bdd){bdd=d;bd=o;bdi=i;}});
-      pts.push([bd.drop[1],bd.drop[0]]);
-      dropSeq.push({pt:[bd.drop[1],bd.drop[0]],order:bd});
-      cur=bd.drop;
-      remD.splice(bdi,1);
-    }
-  }
-  if(pts.length>=2){
-    WHATIF_LAYERS.push(L.polyline(pts,{color:color,weight:dashed?3:2.5,opacity:.9,dashArray:dashed?'8 4':null}).addTo(map));
-  }
-  // Label at start
-  if(pts.length){
-    var lic=L.divIcon({className:'',html:'<div style="background:'+color+';color:#0d1117;font-family:monospace;font-size:10px;font-weight:800;padding:1px 5px;border-radius:4px">'+label+'</div>',iconAnchor:[0,6]});
-    WHATIF_LAYERS.push(L.marker(pts[0],{icon:lic,zIndexOffset:600}).addTo(map));
-  }
-  // Pick markers
-  pickSeq.forEach(function(p,i){
-    var shared=p.count>1;
-    var bg=shared?'#4ade80':color;
-    var lbl=(dashed?'wP':'P')+(i+1)+(shared?'×'+p.count:'');
-    var ric=L.divIcon({className:'',html:'<div style="background:'+bg+';color:#0d1117;font-family:monospace;font-size:9px;font-weight:800;padding:1px 4px;border-radius:3px;white-space:nowrap">'+lbl+'</div>',iconAnchor:[-4,6]});
-    WHATIF_LAYERS.push(L.marker(p.pt,{icon:ric,interactive:false,zIndexOffset:700}).addTo(map));
-  });
-  // Drop markers
-  dropSeq.forEach(function(d,i){
-    var lbl=(dashed?'wD':'D')+(i+1);
-    var dic=L.divIcon({className:'',html:'<div style="background:#fbbf24;color:#0d1117;font-family:monospace;font-size:9px;font-weight:800;padding:1px 4px;border-radius:3px">'+lbl+'</div>',iconAnchor:[-4,6]});
-    WHATIF_LAYERS.push(L.marker(d.pt,{icon:dic,interactive:false,zIndexOffset:700}).addTo(map));
-  });
-}
-
-function computeWaveDistGlobal(orders){
-  var wc=orders.filter(function(o){return o.pick&&o.drop;});
-  if(!wc.length) return 0;
-  var sorted2=wc.slice().sort(function(a,b){return (a.incharge_ts||a.created_ts||'').localeCompare(b.incharge_ts||b.created_ts||'');});
-  var cur=sorted2[0].incharge||sorted2[0].pick,total=0,rem=sorted2.slice();
-  while(rem.length){
-    var b2=rem[0],bd=Infinity,bi=0;
-    rem.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.pick[1],o.pick[0]);if(d<bd){bd=d;b2=o;bi=i;}});
-    var cluster=[b2],still=[];
-    rem.forEach(function(o,i){if(i===bi) return;if(haverDist(b2.pick[1],b2.pick[0],o.pick[1],o.pick[0])<=200) cluster.push(o);else still.push(o);});
-    total+=bd;cur=b2.pick;rem=still;
-    var rd=cluster.slice();
-    while(rd.length){var bd2=rd[0],bdd=Infinity,bdi=0;rd.forEach(function(o,i){var d=haverDist(cur[1],cur[0],o.drop[1],o.drop[0]);if(d<bdd){bdd=d;bd2=o;bdi=i;}});total+=bdd;cur=bd2.drop;rd.splice(bdi,1);}
-  }
-  return total;
-}
-
-function toggleWhatIfOrder(){} // legacy stub — replaced by toggleWhatIfSel
-
-
-
-
+// ── BOOT ──
 setTimeout(function(){map.invalidateSize();},300);
 setTimeout(function(){map.invalidateSize();},1000);
 document.addEventListener('keydown',function(e){if(e.key==='Escape') clearOrderSel();});
